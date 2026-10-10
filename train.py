@@ -14,6 +14,10 @@ p.add_argument("--epochs", type=int, default=6)
 p.add_argument("--max_rows", type=int, default=0, help="use only N training rows (quick test)")
 p.add_argument("--seed", type=int, default=42)
 p.add_argument("--device", default="auto")
+p.add_argument("--ablate", choices=["none", "nomarkdown", "nopunct", "short"], default="none",
+               help="remove a signal: markdown/formatting, punctuation, or length")
+p.add_argument("--train_domains", default="all", help="comma list of chat,qa,bench or all")
+p.add_argument("--test_domains", default="all", help="comma list of chat,qa,bench or all")
 args = p.parse_args()
 
 random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
@@ -24,6 +28,23 @@ print("Device:", dev)
 
 # ---------- data ----------
 train = pd.read_csv("train.csv"); val = pd.read_csv("val.csv"); test = pd.read_csv("test.csv")
+
+def domain_of(sub):
+    if str(sub).startswith("hh-rlhf"): return "chat"
+    if sub == "HelpSteer": return "qa"
+    return "bench"
+for d in (train, val, test):
+    d["domain"] = d["subset"].map(domain_of)
+everything = pd.concat([train, val, test], ignore_index=True)
+
+ALL = ["chat", "qa", "bench"]
+train_doms = ALL if args.train_domains == "all" else args.train_domains.split(",")
+test_doms = ALL if args.test_domains == "all" else args.test_domains.split(",")
+default_mode = (args.train_domains == "all" and args.test_domains == "all")
+if not default_mode:
+    train = train[train["domain"].isin(train_doms)]
+    val = val[val["domain"].isin(train_doms)]
+print("Train domains:", train_doms, "| rows:", len(train))
 if args.max_rows:
     train = train.sample(args.max_rows, random_state=args.seed)
     val = val.sample(min(len(val), args.max_rows // 4), random_state=args.seed)
@@ -36,11 +57,18 @@ print("Classes:", classes)
 # ---------- tokenizer ----------
 TOK = re.compile(r"\w+|[^\w\s]")
 def tokenize(text):
-    text = str(text).replace("\n", " NEWLINE ")
+    text = str(text)
+    if args.ablate == "nomarkdown":      # remove bullets, bold, headers, code marks, line breaks
+        text = re.sub(r"(?m)^\s*(?:[-*\u2022]|\d+[.)])\s+", " ", text)
+        text = re.sub(r"[*#`_~>|]", " ", text)
+        text = text.replace("\n", " ")
+    if args.ablate == "nopunct":         # remove all punctuation (line breaks are kept)
+        text = re.sub(r"[^\w\s]", " ", text)
+    text = text.replace("\n", " NEWLINE ")
     return TOK.findall(text.lower())
 
 IN_LEN = 128 if args.input == "input" else 64   # max tokens kept from the prompt
-OUT_LEN = 256                                    # max tokens kept from the response
+OUT_LEN = 50 if args.ablate == "short" else 256                                    # max tokens kept from the response
 
 def tokens_for(row_in, row_out):
     if args.input == "output":
@@ -53,7 +81,7 @@ def build(df):
     return [tokens_for(a, b) for a, b in zip(df["llm_input"], df["llm_output"])]
 
 print("Tokenizing...")
-tr_tok, va_tok, te_tok = build(train), build(val), build(test)
+tr_tok, va_tok = build(train), build(val)
 
 # vocabulary from TRAIN only (index 0 = padding, 1 = unknown)
 counts = Counter(t for toks in tr_tok for t in toks)
@@ -71,10 +99,9 @@ def to_tensor(tok_lists):
         X[i, :len(ids)] = ids
     return torch.from_numpy(X)
 
-Xtr, Xva, Xte = to_tensor(tr_tok), to_tensor(va_tok), to_tensor(te_tok)
+Xtr, Xva = to_tensor(tr_tok), to_tensor(va_tok)
 ytr = torch.tensor([c2i[c] for c in train[args.label]])
 yva = torch.tensor([c2i[c] for c in val[args.label]])
-yte = torch.tensor([c2i[c] for c in test[args.label]])
 
 # ---------- models ----------
 class CNN(nn.Module):
@@ -139,29 +166,48 @@ for epoch in range(1, args.epochs + 1):
 
 # ---------- final test evaluation (best epoch) ----------
 model.load_state_dict(best_state)
-pred = predict(Xte)
-acc = accuracy_score(yte, pred); f1 = f1_score(yte, pred, average="macro")
-name = f"{args.model}_{args.input}_{args.label}"
-print(f"\nTEST {name}: accuracy = {acc:.4f}, macro-F1 = {f1:.4f}  (best val acc {best_acc:.4f})")
-
 os.makedirs("results", exist_ok=True)
-with open("results/results.csv", "a") as f:
-    f.write(f"{name},{acc:.4f},{f1:.4f},{best_acc:.4f},rows={len(train)}\n")
-cm = confusion_matrix(yte, pred)
-pd.DataFrame(cm, index=classes, columns=classes).to_csv(f"results/cm_{name}.csv")
-print("Confusion matrix (rows = true, cols = predicted):")
-print(pd.DataFrame(cm, index=classes, columns=classes))
-try:
-    import matplotlib; matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(7, 6))
-    ax.imshow(cm, cmap="Blues")
-    ax.set_xticks(range(n_cls)); ax.set_xticklabels(classes, rotation=45, ha="right")
-    ax.set_yticks(range(n_cls)); ax.set_yticklabels(classes)
-    for i in range(n_cls):
-        for j in range(n_cls):
-            ax.text(j, i, cm[i, j], ha="center", va="center", fontsize=7)
-    ax.set_xlabel("Predicted"); ax.set_ylabel("True"); ax.set_title(name)
-    fig.tight_layout(); fig.savefig(f"results/cm_{name}.png", dpi=150)
-except Exception as e:
-    print("Could not draw plot:", e)
+
+def evaluate(df, name):
+    X = to_tensor(build(df))
+    y = torch.tensor([c2i[c] for c in df[args.label]])
+    pred = predict(X)
+    acc = accuracy_score(y, pred)
+    f1 = f1_score(y, pred, average="macro", labels=list(range(n_cls)), zero_division=0)
+    print(f"\nTEST {name}: accuracy = {acc:.4f}, macro-F1 = {f1:.4f}  (rows = {len(df)})")
+    with open("results/results.csv", "a") as f:
+        f.write(f"{name},{acc:.4f},{f1:.4f},{best_acc:.4f},rows={len(train)},test_rows={len(df)}\n")
+    cm = confusion_matrix(y, pred, labels=list(range(n_cls)))
+    pd.DataFrame(cm, index=classes, columns=classes).to_csv(f"results/cm_{name}.csv")
+    print(pd.DataFrame(cm, index=classes, columns=classes).to_string())
+    try:
+        import matplotlib; matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(7, 6))
+        ax.imshow(cm, cmap="Blues")
+        ax.set_xticks(range(n_cls)); ax.set_xticklabels(classes, rotation=45, ha="right")
+        ax.set_yticks(range(n_cls)); ax.set_yticklabels(classes)
+        for i in range(n_cls):
+            for j in range(n_cls):
+                ax.text(j, i, cm[i, j], ha="center", va="center", fontsize=7)
+        ax.set_xlabel("Predicted"); ax.set_ylabel("True"); ax.set_title(name)
+        fig.tight_layout(); fig.savefig(f"results/cm_{name}.png", dpi=150)
+        plt.close(fig)
+    except Exception as e:
+        print("Could not draw plot:", e)
+
+base = f"{args.model}_{args.input}_{args.label}" + ("" if args.ablate == "none" else "_" + args.ablate)
+if default_mode:
+    evaluate(test, base)                       # same as before: whole test set
+    for d in ALL:                              # extra: per-domain breakdown
+        sub = test[test["domain"] == d]
+        if len(sub):
+            evaluate(sub, f"{base}_alltrain_test-{d}")
+else:
+    tag = "+".join(train_doms)
+    for d in test_doms:
+        if d in train_doms:                    # seen domain: use held-out test prompts
+            sub = test[test["domain"] == d]
+        else:                                  # unseen domain: use ALL its rows
+            sub = everything[everything["domain"] == d]
+        evaluate(sub, f"{base}_train-{tag}_test-{d}")

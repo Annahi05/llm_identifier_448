@@ -1,0 +1,10 @@
+setting,accuracy,macro_f1
+all features,0.6693,0.632
+only length,0.3988,0.2408
+only formatting,0.5571,0.438
+only vocabulary,0.3629,0.2238
+only punctuation,0.3346,0.2332
+without length,0.6578,0.6169
+without formatting,0.5332,0.4679
+without vocabulary,0.6502,0.6097
+without punctuation,0.6436,0.6049
